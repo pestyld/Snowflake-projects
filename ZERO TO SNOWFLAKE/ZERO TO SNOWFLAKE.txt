@@ -1,0 +1,269 @@
+-- Training: Getting Started with Snowflake - Zero to Snowflake
+-- Notebook: https://quickstarts.snowflake.com/guide/getting_started_with_snowflake/index.html#0
+-- Video: https://www.snowflake.com/thankyou/zero-to-snowflake-2023-01-11/
+
+
+-- Setup database and schema
+CREATE OR REPLACE DATABASE citibike;
+USE DATABASE citibike;
+USE SCHEMA PUBLIC;
+
+--
+-- CREATE DATA
+--
+
+-- Create an empty Snowflake table
+create or replace table trips
+    (tripduration integer,
+     starttime timestamp,
+     stoptime timestamp,
+     start_station_id integer,
+     start_station_name string,
+     start_station_latitude float,
+     start_station_longitude float,
+     end_station_id integer,
+     end_station_name string,
+     end_station_latitude float,
+     end_station_longitude float,
+     bikeid integer,
+     membership_type string,
+     usertype string,
+     birth_year integer,
+     gender integer);
+
+
+-- Create a stage to the citibike data. That is a pointer to the location of the data and name the stage (think addCaslib action / caslibs)
+CREATE STAGE citibike_trips
+    url = 's3://snowflake-workshop-lab/citibike-trips-csv/';
+
+-- View what's available in the stage (think fileInfo action on a caslib)
+LIST @citibike_trips;
+
+-- Create the file format for data ingestion to Snowflake (think importOptions or read_csv options)
+CREATE OR REPLACE FILE FORMAT csv
+    type='csv'
+    compression = 'auto' 
+    field_delimiter = ',' 
+    record_delimiter = '\n'
+    skip_header = 0 
+    field_optionally_enclosed_by = '\042' 
+    trim_space = false
+    error_on_column_count_mismatch = false 
+    escape = 'none' 
+    escape_unenclosed_field = '\134'
+    date_format = 'auto' 
+    timestamp_format = 'auto' 
+    null_if = ('') 
+    comment = 'file format for ingesting data for zero to snowflake';
+
+SHOW FILE FORMATS IN DATABASE CITIBIKE;
+
+
+-- Loading data to Snowflake (loadTable)
+-- TRIPS is the empty table, @citibike is the stage (caslib/data location), file_format is the import options, pattern is the files to import
+
+USE WAREHOUSE COMPUTE_WH;
+
+COPY INTO TRIPS FROM @citibike_trips file_format=csv PATTERN = '.*csv.*';
+
+
+--
+-- QUERIES
+--
+
+-- Preview the TRIPS table 
+SELECT count(*) 
+FROM CITIBIKE.PUBLIC.TRIPS;
+
+SELECT *
+FROM CITIBIKE.PUBLIC.TRIPS
+LIMIT 10;
+
+
+-- Create analytics warehouse
+CREATE OR REPLACE WAREHOUSE analytics_wh 
+    WITH WAREHOUSE_TYPE = STANDARD
+         WAREHOUSE_SIZE = XSMALL;
+
+SHOW WAREHOUSES;
+
+
+--
+-- PERFORM ANALYTICS
+--
+
+USE WAREHOUSE analytics_wh;
+
+-- preview
+SELECT *
+FROM TRIPS
+LIMIT 10;
+
+
+-- Summarize by hour for each day
+-- STARTTIME: 2018-05-15 12:22:45.000
+SELECT 
+    date_trunc('hour', starttime) as DATE_HOUR,
+    count(*) as NUM_TRIPS,
+    round(avg(tripduration)/60) as AVG_DURATION_MIN,
+    round(avg(haversine(start_station_latitude, start_station_longitude, end_station_latitude, end_station_longitude)),1) as AVG_DISTANCE_KM
+FROM TRIPS
+GROUP BY DATE_HOUR
+ORDER BY DATE_HOUR;
+
+-- Group by month
+SELECT
+    monthname(starttime) as MONTH,
+    count(*) as NUM_TRIPS
+FROM TRIPS
+GROUP BY MONTH
+ORDER BY NUM_TRIPS DESC;
+
+
+-- CLONE (ZERO COPY CLONE)
+-- Snowflake allows you to create clones, also known as "zero-copy clones" of tables, schemas, and databases in seconds. When a clone is created, Snowflake takes a snapshot of data present in the source object and makes it available to the cloned object. The cloned object is writable and independent of the clone source. Therefore, changes made to either the source object or the clone object are not included in the other.
+
+-- A popular use case for zero-copy cloning is to clone a production environment for use by Development & Testing teams to test and experiment without adversely impacting the production environment and eliminating the need to set up and manage two separate environments.
+
+CREATE TABLE trips_dev CLONE trips;
+
+
+--
+-- WEATHER DATA
+--
+
+CREATE DATABASE weather;
+USE DATABASE weather;
+USE SCHEMA public;
+USE WAREHOUSE compute_wh;
+
+-- CREATE TABLE
+-- Note that Snowflake has a special column data type called VARIANT that allows storing the entire JSON object as a single row and eventually query the object directly.
+
+CREATE TABLE json_weather_data 
+    (v variant);
+
+CREATE STAGE nyc_weather
+    URL = 's3://snowflake-workshop-lab/zero-weather-nyc';
+
+-- View available files in the stage (fileInfo)
+LIST @nyc_weather;
+
+-- LOAD JSON DATA
+COPY INTO json_weather_data 
+    FROM @nyc_weather
+    file_format = (type = json
+                   strip_outer_array = true);
+    
+SELECT *
+FROM json_weather_data
+LIMIT 10;
+
+-- SQL dot notation v:temp is used in this command to pull out values at lower levels within the JSON object hierarchy. This allows us to treat each field as if it were a column in a relational table.
+
+CREATE OR REPLACE VIEW json_weather_data_vw AS
+SELECT
+    v:obsTime::timestamp as observation_time,
+    v:station::string as station_id,
+    v:name::string as city_name,
+    v:country::string as country,
+    v:latitude::float as city_lat,
+    v:longitude::float as city_lon,
+    v:weatherCondition::string as weather_conditions,
+    v:coco::int as weather_conditions_code,
+    v:temp::float as temp,
+    v:prcp::float as rain,
+    v:tsun::float as tsun,
+    v:wdir::float as wind_dir,
+    v:wspd::float as wind_speed,
+    v:dwpt::float as dew_point,
+    v:rhum::float as relative_humidity,
+    v:pres::float as pressure
+FROM
+    json_weather_data
+WHERE
+    station_id = '72502';
+
+
+SELECT *
+FROM json_weather_data_vw
+LIMIT 10;
+
+SELECT *
+FROM json_weather_data_vw
+WHERE date_trunc('month', observation_time) = '2018-01-01'
+LIMIT 20;
+
+
+SELECT *
+FROM citibike.public.trips
+LIMIT 10;
+
+SELECT
+    weather_conditions as conditions,
+    count(*) as num_trips
+FROM  citibike.public.trips LEFT JOIN
+      json_weather_data_vw
+ON date_trunc('hour',observation_time) = date_trunc('hour',starttime)
+-- WHERE conditions is not null
+GROUP BY conditions
+ORDER BY num_trips DESC;
+
+
+
+--
+-- TIME TRAVEL (24 hours, up to 90 days (enterprise))
+--
+
+DROP TABLE json_weather_data;
+
+SELECT *
+FROM json_weather_data
+LIMIT 10;
+
+UNDROP TABLE json_weather_data;
+
+
+USE DATABASE citibike;
+USE SCHEMA public;
+
+-- Change column name on accident
+UPDATE trips
+    SET start_station_name = 'oops';
+
+SELECT * FROM trips LIMIT 10;
+
+
+-- Get query ID
+SET query_id =
+(SELECT query_id
+    FROM table(information_schema.query_history_by_session (result_limit=>30))
+    WHERE upper(query_text) like 'UPDATE%'
+    ORDER BY start_time DESC
+    LIMIT 20);
+
+-- Use the original table
+CREATE OR REPLACE TABLE trips as
+(
+SELECT * 
+FROM trips
+BEFORE (statement => $query_id)
+);
+
+SELECT *
+FROM trips
+LIMIT 10
+
+
+-- 
+-- Working with Roles and Account Usage
+--
+
+
+USE ROLE accountadmin;
+
+CREATE ROLE junior_dba;
+GRANT ROLE junior_dba to user JSHAFFER;
+USE ROLE junior_dba;
+
+
